@@ -7,8 +7,7 @@ from django.db.models import Count
 from django.db.models.functions import TruncDate
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from rest_framework import generics, permissions, status
-from rest_framework.exceptions import ValidationError
+from rest_framework import generics
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -32,6 +31,7 @@ from rest_framework.permissions import (
                                         AllowAny,
                                         IsAuthenticated)
 from accounts.token_authentication import TokenAuthentication
+from .tasks import auto_sync_all_git_accounts_task, sync_account_task
 
 STATE_SALT = 'integrations.oauth.state'
 STATE_MAX_AGE = 300  # seconds
@@ -46,6 +46,24 @@ def _read_state(state):
     return data['user_id']
 
 
+def success_response(data=None, message=''):
+    """Standard success envelope used by every view in this file."""
+    content_data = {}
+    content_data['status'] = 200
+    content_data['message'] = message
+    if data is not None:
+        content_data['data'] = data
+    return Response(content_data)
+
+
+def error_response(error, status_code=400):
+    """Standard error envelope used by every view in this file."""
+    content_data = {}
+    content_data['status'] = status_code
+    content_data['error'] = error
+    return Response(content_data)
+
+
 class GitHubConnectView(APIView):
     """Step 1: authenticated user asks for the URL to redirect their browser to."""
 
@@ -54,7 +72,10 @@ class GitHubConnectView(APIView):
 
     def get(self, request):
         state = _make_state(request.user.id)
-        return Response({'authorize_url': github.get_authorize_url(state)})
+        return success_response(
+            data={'authorize_url': github.get_authorize_url(state)},
+            message='GitHub authorize URL generated successfully',
+        )
 
 
 class GitHubCallbackView(APIView):
@@ -67,12 +88,12 @@ class GitHubCallbackView(APIView):
         code = request.query_params.get('code')
         state = request.query_params.get('state')
         if not code or not state:
-            raise ValidationError('Missing code or state.')
+            return error_response('Missing code or state.')
 
         try:
             user_id = _read_state(state)
         except signing.BadSignature:
-            raise ValidationError('Invalid or expired state.')
+            return error_response('Invalid or expired state.')
 
         token_data = github.exchange_code_for_token(code)
         profile = github.get_authenticated_user(token_data['access_token'])
@@ -88,15 +109,22 @@ class GitHubCallbackView(APIView):
                 'access_token': token_data['access_token'],
             },
         )
-        return Response(GitAccountSerializer(git_account).data)
+        return success_response(
+            data=GitAccountSerializer(git_account).data,
+            message='GitHub account connected successfully',
+        )
 
 
 class GitLabConnectView(APIView):
     authentication_classes = [SessionAuthentication, BasicAuthentication, TokenAuthentication]
     permission_classes = [IsAuthenticated]
+
     def get(self, request):
         state = _make_state(request.user.id)
-        return Response({'authorize_url': gitlab.get_authorize_url(state)})
+        return success_response(
+            data={'authorize_url': gitlab.get_authorize_url(state)},
+            message='GitLab authorize URL generated successfully',
+        )
 
 
 class GitLabCallbackView(APIView):
@@ -107,12 +135,12 @@ class GitLabCallbackView(APIView):
         code = request.query_params.get('code')
         state = request.query_params.get('state')
         if not code or not state:
-            raise ValidationError('Missing code or state.')
+            return error_response('Missing code or state.')
 
         try:
             user_id = _read_state(state)
         except signing.BadSignature:
-            raise ValidationError('Invalid or expired state.')
+            return error_response('Invalid or expired state.')
 
         token_data = gitlab.exchange_code_for_token(code)
         profile = gitlab.get_authenticated_user(token_data['access_token'])
@@ -129,7 +157,10 @@ class GitLabCallbackView(APIView):
                 'refresh_token': token_data.get('refresh_token', ''),
             },
         )
-        return Response(GitAccountSerializer(git_account).data)
+        return success_response(
+            data=GitAccountSerializer(git_account).data,
+            message='GitLab account connected successfully',
+        )
 
 
 class GitAccountListView(generics.ListAPIView):
@@ -139,6 +170,10 @@ class GitAccountListView(generics.ListAPIView):
 
     def get_queryset(self):
         return self.request.user.git_accounts.all()
+
+    def list(self, request, *args, **kwargs):
+        serializer = self.get_serializer(self.filter_queryset(self.get_queryset()), many=True)
+        return success_response(data=serializer.data, message='Git accounts fetched successfully')
 
 
 class SyncView(APIView):
@@ -153,20 +188,21 @@ class SyncView(APIView):
         if provider:
             accounts = accounts.filter(provider=provider)
             if not accounts.exists():
-                raise ValidationError(f'No connected {provider} account.')
+                return error_response(f'No connected {provider} account.')
 
         synced = []
         for git_account in accounts:
             sync_account(git_account)
             synced.append(git_account)
 
-        return Response(
-            {
+        return success_response(
+            data={
                 'synced_accounts': GitAccountSerializer(synced, many=True).data,
                 'repository_count': Repository.objects.filter(
                     git_account__in=synced
                 ).count(),
-            }
+            },
+            message='Sync completed successfully',
         )
 
 
@@ -177,6 +213,10 @@ class RepositoryListView(generics.ListAPIView):
 
     def get_queryset(self):
         return Repository.objects.filter(git_account__user=self.request.user)
+
+    def list(self, request, *args, **kwargs):
+        serializer = self.get_serializer(self.filter_queryset(self.get_queryset()), many=True)
+        return success_response(data=serializer.data, message='Repositories fetched successfully')
 
 
 class RepositoryCommitListView(generics.ListAPIView):
@@ -189,6 +229,12 @@ class RepositoryCommitListView(generics.ListAPIView):
             Repository, id=self.kwargs['repository_id'], git_account__user=self.request.user
         )
         return repository.commits.prefetch_related('files')
+
+    def list(self, request, *args, **kwargs):
+        serializer = self.get_serializer(self.filter_queryset(self.get_queryset()), many=True)
+        return success_response(
+            data=serializer.data, message='Repository commits fetched successfully'
+        )
 
 
 class CommitListView(generics.ListAPIView):
@@ -210,6 +256,10 @@ class CommitListView(generics.ListAPIView):
             queryset = queryset.filter(status=status_filter)
         return queryset
 
+    def list(self, request, *args, **kwargs):
+        serializer = self.get_serializer(self.filter_queryset(self.get_queryset()), many=True)
+        return success_response(data=serializer.data, message='Commits fetched successfully')
+
 
 class CommitReviewView(APIView):
     """Staff-only: mark a commit as approved or rejected."""
@@ -220,10 +270,14 @@ class CommitReviewView(APIView):
     def patch(self, request, commit_id):
         commit = get_object_or_404(Commit, id=commit_id)
         serializer = CommitReviewSerializer(commit, data=request.data, partial=True)
-        serializer.is_valid(raise_exception=True)
-        serializer.save(reviewed_by=request.user, reviewed_at=timezone.now())
-        return Response(CommitSerializer(commit).data, status=status.HTTP_200_OK)
 
+        if serializer.is_valid():
+            serializer.save(reviewed_by=request.user, reviewed_at=timezone.now())
+            return success_response(
+                data=CommitSerializer(commit).data, message='Commit updated successfully'
+            )
+        else:
+            return error_response(serializer.errors)
 
 
 class CommitCalendarView(APIView):
@@ -268,7 +322,7 @@ class CommitCalendarView(APIView):
             try:
                 year = int(year)
             except ValueError:
-                raise ValidationError('year must be an integer.')
+                return error_response('year must be an integer.')
             start_date = date(year, 1, 1)
             end_date = date(year, 12, 31)
         else:
@@ -299,14 +353,15 @@ class CommitCalendarView(APIView):
             )
             current += timedelta(days=1)
 
-        return Response(
-            {
+        return success_response(
+            data={
                 'start_date': start_date.isoformat(),
                 'end_date': end_date.isoformat(),
                 'total_commits': sum(day['count'] for day in days),
                 'levels': self.LEVEL_COLORS,
                 'days': days,
-            }
+            },
+            message='Commit calendar fetched successfully',
         )
 
     @classmethod
@@ -333,45 +388,44 @@ class RepositoryBranchListView(APIView):
         )
         git_account = repository.git_account
         default_branch = repository.default_branch
-        print("RepositoryBranchListView: repository_id:", repository_id, "default_branch:", default_branch)
-        print("git_account:", git_account, "provider:", git_account.provider, "access_token:", git_account.access_token)
 
-        if git_account.provider == GitAccount.Provider.GITLAB:
-            branches = self._gitlab_branch_status(git_account, repository, default_branch)
-        else:
-            branches = self._github_branch_status(git_account, repository, default_branch)
+        try:
+            if git_account.provider == GitAccount.Provider.GITLAB:
+                branches = self._gitlab_branch_status(git_account, repository, default_branch)
+            else:
+                branches = self._github_branch_status(git_account, repository, default_branch)
+        except requests.HTTPError as exc:
+            return error_response(f'Failed to fetch branches: {exc}')
 
-        return Response({'default_branch': default_branch, 'branches': branches})
+        return success_response(
+            data={'default_branch': default_branch, 'branches': branches},
+            message='Branches fetched successfully',
+        )
 
     @staticmethod
     def _gitlab_branch_status(git_account, repository, default_branch):
         token = git_account.access_token
         project_id = repository.provider_repo_id
-        print("RepositoryBranchListView: _gitlab_branch_status: project_id:", project_id, "default_branch:", default_branch)
-        print("RepositoryBranchListView: _gitlab_branch_status: token:", token)
         results = []
-        try:
-            for branch in gitlab.iter_branches(token, project_id):
-                name = branch['name']
-                is_default = name == default_branch
-                ahead = behind = 0
-                if not is_default:
-                    ahead = len(gitlab.compare_refs(token, project_id, default_branch, name))
-                    behind = len(gitlab.compare_refs(token, project_id, name, default_branch))
-                results.append(
-                    {
-                        'name': name,
-                        'is_default': is_default,
-                        'merged': branch.get('merged', False),
-                        'protected': branch.get('protected', False),
-                        'ahead_by': ahead,
-                        'behind_by': behind,
-                    }
-                )
-            return results
-        except requests.HTTPError as exc:
-            raise ValidationError(f'Failed to fetch branches from GitLab: {exc}')
-        
+        for branch in gitlab.iter_branches(token, project_id):
+            name = branch['name']
+            is_default = name == default_branch
+            ahead = behind = 0
+            if not is_default:
+                ahead = len(gitlab.compare_refs(token, project_id, default_branch, name))
+                behind = len(gitlab.compare_refs(token, project_id, name, default_branch))
+            results.append(
+                {
+                    'name': name,
+                    'is_default': is_default,
+                    'merged': branch.get('merged', False),
+                    'protected': branch.get('protected', False),
+                    'ahead_by': ahead,
+                    'behind_by': behind,
+                }
+            )
+        return results
+
     @staticmethod
     def _github_branch_status(git_account, repository, default_branch):
         token = git_account.access_token
@@ -425,9 +479,12 @@ class RepositoryTreeView(APIView):
             else:
                 items = self._github_tree(git_account, repository, path, ref)
         except requests.HTTPError as exc:
-            raise ValidationError(f'Failed to fetch repository tree: {exc}')
+            return error_response(f'Failed to fetch repository tree: {exc}')
 
-        return Response({'path': path, 'ref': ref, 'items': items})
+        return success_response(
+            data={'path': path, 'ref': ref, 'items': items},
+            message='Repository tree fetched successfully',
+        )
 
     @staticmethod
     def _github_tree(git_account, repository, path, ref):
@@ -473,10 +530,12 @@ class RepositoryFileContentView(APIView):
         )
         path = request.query_params.get('path', '').strip('/')
         if not path:
-            raise ValidationError('path query param is required.')
+            return error_response('path query param is required.')
+
         ref = request.query_params.get('ref') or repository.default_branch
         if not ref:
-            raise ValidationError('No ref provided and repository has no default_branch on record.')
+            return error_response('No ref provided and repository has no default_branch on record.')
+
         git_account = repository.git_account
 
         try:
@@ -486,9 +545,9 @@ class RepositoryFileContentView(APIView):
                 owner, name = repository.full_name.split('/', 1)
                 raw = github.get_contents(git_account.access_token, owner, name, path, ref)
                 if isinstance(raw, list):
-                    raise ValidationError('path points to a directory, not a file.')
+                    return error_response('path points to a directory, not a file.')
         except requests.HTTPError as exc:
-            raise ValidationError(f'Failed to fetch file: {exc}')
+            return error_response(f'Failed to fetch file: {exc}')
 
         encoded_content = raw.get('content', '')
         content_bytes = base64.b64decode(encoded_content) if encoded_content else b''
@@ -497,14 +556,15 @@ class RepositoryFileContentView(APIView):
         except UnicodeDecodeError:
             content, binary = base64.b64encode(content_bytes).decode('ascii'), True
 
-        return Response(
-            {
+        return success_response(
+            data={
                 'path': path,
                 'ref': ref,
                 'size': raw.get('size'),
                 'binary': binary,
                 'content': content,
-            }
+            },
+            message='File fetched successfully',
         )
 
 
@@ -523,7 +583,10 @@ class RepositoryLanguageStatsView(APIView):
         commit_files = CommitFile.objects.filter(commit__repository=repository)
         languages = calculate_language_stats(commit_files)
 
-        return Response({'repository': repository.full_name, 'languages': languages})
+        return success_response(
+            data={'repository': repository.full_name, 'languages': languages},
+            message='Language stats fetched successfully',
+        )
 
 
 class RepositoryMergeRequestListView(generics.ListAPIView):
@@ -538,6 +601,12 @@ class RepositoryMergeRequestListView(generics.ListAPIView):
             Repository, id=self.kwargs['repository_id'], git_account__user=self.request.user
         )
         return repository.merge_requests.all()
+
+    def list(self, request, *args, **kwargs):
+        serializer = self.get_serializer(self.filter_queryset(self.get_queryset()), many=True)
+        return success_response(
+            data=serializer.data, message='Repository merge requests fetched successfully'
+        )
 
 
 class MergeRequestListView(generics.ListAPIView):
@@ -557,6 +626,12 @@ class MergeRequestListView(generics.ListAPIView):
             queryset = queryset.filter(status=status_filter)
         return queryset
 
+    def list(self, request, *args, **kwargs):
+        serializer = self.get_serializer(self.filter_queryset(self.get_queryset()), many=True)
+        return success_response(
+            data=serializer.data, message='Merge requests fetched successfully'
+        )
+
 
 class MergeRequestReviewView(APIView):
     """Staff-only: verify a merge request and accept (merge), reject, or close it.
@@ -565,42 +640,47 @@ class MergeRequestReviewView(APIView):
     PR/MR actually gets merged or closed — this isn't just a local status flag.
     """
 
-
     authentication_classes = [SessionAuthentication, BasicAuthentication, TokenAuthentication]
     permission_classes = [IsAuthenticated]
 
     def patch(self, request, merge_request_id):
         merge_request = get_object_or_404(MergeRequest, id=merge_request_id)
         serializer = MergeRequestReviewSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        action = serializer.validated_data['action']
-        review_notes = serializer.validated_data['review_notes']
 
-        git_account = merge_request.repository.git_account
+        if serializer.is_valid():
+            action = serializer.validated_data['action']
+            review_notes = serializer.validated_data['review_notes']
 
-        try:
-            if action == 'merge':
-                self._merge_on_provider(git_account, merge_request)
-                new_status = MergeRequest.Status.APPROVED
-                new_provider_state = MergeRequest.ProviderState.MERGED
-            elif action == 'close':
-                self._close_on_provider(git_account, merge_request)
-                new_status = MergeRequest.Status.CLOSED
-                new_provider_state = MergeRequest.ProviderState.CLOSED
-            else:  # reject — internal review decision only, provider PR/MR is left as-is
-                new_status = MergeRequest.Status.REJECTED
-                new_provider_state = merge_request.provider_state
-        except requests.HTTPError as exc:
-            raise ValidationError(f'{action} failed on the provider: {exc}')
+            git_account = merge_request.repository.git_account
 
-        merge_request.status = new_status
-        merge_request.provider_state = new_provider_state
-        merge_request.reviewed_by = request.user
-        merge_request.reviewed_at = timezone.now()
-        merge_request.review_notes = review_notes
-        merge_request.save()
+            try:
+                if action == 'merge':
+                    self._merge_on_provider(git_account, merge_request)
+                    new_status = MergeRequest.Status.APPROVED
+                    new_provider_state = MergeRequest.ProviderState.MERGED
+                elif action == 'close':
+                    self._close_on_provider(git_account, merge_request)
+                    new_status = MergeRequest.Status.CLOSED
+                    new_provider_state = MergeRequest.ProviderState.CLOSED
+                else:  # reject — internal review decision only, provider PR/MR is left as-is
+                    new_status = MergeRequest.Status.REJECTED
+                    new_provider_state = merge_request.provider_state
+            except requests.HTTPError as exc:
+                return error_response(f'{action} failed on the provider: {exc}')
 
-        return Response(MergeRequestSerializer(merge_request).data, status=status.HTTP_200_OK)
+            merge_request.status = new_status
+            merge_request.provider_state = new_provider_state
+            merge_request.reviewed_by = request.user
+            merge_request.reviewed_at = timezone.now()
+            merge_request.review_notes = review_notes
+            merge_request.save()
+
+            return success_response(
+                data=MergeRequestSerializer(merge_request).data,
+                message='Merge request updated successfully',
+            )
+        else:
+            return error_response(serializer.errors)
 
     @staticmethod
     def _merge_on_provider(git_account, merge_request):
@@ -627,3 +707,14 @@ class MergeRequestReviewView(APIView):
             gitlab.close_merge_request(
                 git_account.access_token, repository.provider_repo_id, merge_request.provider_mr_id
             )
+
+
+
+class AutoSyncView(APIView):
+
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request):
+        auto_sync_all_git_accounts_task.delay()
+        return Response({'status': 'ok'})

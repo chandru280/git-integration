@@ -19,6 +19,7 @@ from integrations.views import (
     RepositoryMergeRequestListView,
     RepositoryTreeView,
     SyncView,
+    AutoSyncView,
 )
 
 app_name = 'integrations'
@@ -42,4 +43,5 @@ urlpatterns = [
     path('repositories/<uuid:repository_id>/merge-requests/',RepositoryMergeRequestListView.as_view()),     # List merge requests (PRs/MRs) belonging to one specific repository
     path('merge-requests/', MergeRequestListView.as_view()),        # List merge requests (all for staff, own repos only for regular users)
     path('merge-requests/<uuid:merge_request_id>/review/',MergeRequestReviewView.as_view()),        # Staff-only: merge, reject, or close a single merge request
+    path('auto-sync/',AutoSyncView.as_view()),      # Trigger a full auto-sync of repos/commits/merge requests for the current user
 ]
