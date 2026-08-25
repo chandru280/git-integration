@@ -1,6 +1,7 @@
 from rest_framework import serializers
 
 from integrations.models import Commit, CommitFile, GitAccount, MergeRequest, Repository
+from integrations.services.languages import calculate_language_stats
 
 
 class GitAccountSerializer(serializers.ModelSerializer):
@@ -48,9 +49,13 @@ class CommitSerializer(serializers.ModelSerializer):
     repository = serializers.CharField(source='repository.full_name', read_only=True)
     reviewed_by = serializers.SerializerMethodField()
     files = CommitFileSerializer(many=True, read_only=True)
+    language_stats = serializers.SerializerMethodField()
 
     def get_reviewed_by(self, commit):
         return commit.reviewed_by.email if commit.reviewed_by else None
+
+    def get_language_stats(self, commit):
+        return calculate_language_stats(commit.files.all())
 
     class Meta:
         model = Commit
@@ -70,6 +75,7 @@ class CommitSerializer(serializers.ModelSerializer):
             'reviewed_at',
             'review_notes',
             'files',
+            'language_stats',
         )
         read_only_fields = fields
 

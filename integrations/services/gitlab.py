@@ -1,4 +1,4 @@
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import requests
 from django.conf import settings
@@ -153,6 +153,47 @@ def iter_merge_requests(access_token, project_id, updated_after=None):
             break
         yield from items
         page += 1
+
+
+def list_tree(access_token, project_id, path='', ref=None):
+    """Directory listing for `path` (repo root if empty) at `ref`. Each item has
+    `name`, `path`, and `type` ('tree' for a folder, 'blob' for a file)."""
+    params = {'per_page': 100}
+    if path:
+        params['path'] = path
+    if ref:
+        params['ref'] = ref
+
+    items = []
+    page = 1
+    while True:
+        response = requests.get(
+            f'{API_URL}/projects/{project_id}/repository/tree',
+            headers=_headers(access_token),
+            params={**params, 'page': page},
+            timeout=15,
+        )
+        response.raise_for_status()
+        batch = response.json()
+        if not batch:
+            break
+        items.extend(batch)
+        page += 1
+    return items
+
+
+def get_file(access_token, project_id, file_path, ref):
+    """A single file's metadata + base64-encoded content at `ref`. `ref` is required
+    by GitLab's API (unlike GitHub's, which defaults to the repo's default branch)."""
+    encoded_path = quote(file_path, safe='')
+    response = requests.get(
+        f'{API_URL}/projects/{project_id}/repository/files/{encoded_path}',
+        headers=_headers(access_token),
+        params={'ref': ref},
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 def merge_merge_request(access_token, project_id, merge_iid):

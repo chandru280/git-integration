@@ -157,6 +157,21 @@ def iter_pull_requests(access_token, owner, repo, sort='created', direction='des
         page += 1
 
 
+def get_contents(access_token, owner, repo, path='', ref=None):
+    """Directory listing or file metadata for `path` (repo root if empty).
+    Returns a list of dicts for a directory, or a single dict for a file — the file
+    dict includes a base64-encoded `content` field."""
+    url = f'{API_URL}/repos/{owner}/{repo}/contents'
+    if path:
+        url += f'/{path}'
+    params = {}
+    if ref:
+        params['ref'] = ref
+    response = requests.get(url, headers=_headers(access_token), params=params, timeout=15)
+    response.raise_for_status()
+    return response.json()
+
+
 def merge_pull_request(access_token, owner, repo, number, commit_message=''):
     """Actually merges the PR on GitHub. Raises requests.HTTPError if it can't be merged
     (e.g. conflicts, failing required checks, branch protection)."""

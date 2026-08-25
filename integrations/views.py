@@ -1,3 +1,4 @@
+import base64
 from datetime import date, timedelta
 
 import requests
@@ -11,7 +12,7 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from integrations.models import Commit, GitAccount, MergeRequest, Repository
+from integrations.models import Commit, CommitFile, GitAccount, MergeRequest, Repository
 from integrations.serializers import (
     CommitReviewSerializer,
     CommitSerializer,
@@ -21,6 +22,7 @@ from integrations.serializers import (
     RepositorySerializer,
 )
 from integrations.services import github, gitlab
+from integrations.services.languages import calculate_language_stats
 from integrations.services.sync import sync_account, sync_all_accounts_for_user
 from rest_framework.authentication import (
                                     BasicAuthentication,
@@ -393,6 +395,135 @@ class RepositoryBranchListView(APIView):
                 }
             )
         return results
+
+
+class RepositoryTreeView(APIView):
+    """Browse a repository's file tree, GitHub/GitLab-browser style: click into the
+    repository and see its root files/folders, click a folder to see what's inside.
+    Fetched live from the provider on every call (not stored locally), so it's
+    always current and needs no extra sync/storage.
+
+    Query params:
+      - path: folder to list, relative to repo root (default: '' = root)
+      - ref: branch/commit to read from (default: the repository's default branch)
+    """
+
+    authentication_classes = [SessionAuthentication, BasicAuthentication, TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, repository_id):
+        repository = get_object_or_404(
+            Repository, id=repository_id, git_account__user=request.user
+        )
+        path = request.query_params.get('path', '').strip('/')
+        ref = request.query_params.get('ref') or repository.default_branch
+        git_account = repository.git_account
+
+        try:
+            if git_account.provider == GitAccount.Provider.GITLAB:
+                items = self._gitlab_tree(git_account, repository, path, ref)
+            else:
+                items = self._github_tree(git_account, repository, path, ref)
+        except requests.HTTPError as exc:
+            raise ValidationError(f'Failed to fetch repository tree: {exc}')
+
+        return Response({'path': path, 'ref': ref, 'items': items})
+
+    @staticmethod
+    def _github_tree(git_account, repository, path, ref):
+        owner, name = repository.full_name.split('/', 1)
+        contents = github.get_contents(git_account.access_token, owner, name, path, ref)
+        if isinstance(contents, dict):
+            # `path` pointed straight at a file rather than a directory.
+            contents = [contents]
+        return [
+            {
+                'name': item['name'],
+                'path': item['path'],
+                'type': 'dir' if item['type'] == 'dir' else 'file',
+                'size': item.get('size'),
+            }
+            for item in contents
+        ]
+
+    @staticmethod
+    def _gitlab_tree(git_account, repository, path, ref):
+        items = gitlab.list_tree(git_account.access_token, repository.provider_repo_id, path, ref)
+        return [
+            {
+                'name': item['name'],
+                'path': item['path'],
+                'type': 'dir' if item['type'] == 'tree' else 'file',
+                'size': None,
+            }
+            for item in items
+        ]
+
+
+class RepositoryFileContentView(APIView):
+    """Fetch a single file's content at a given path/ref, for viewing after the user
+    clicks a file in the tree browser. Fetched live from the provider."""
+
+    authentication_classes = [SessionAuthentication, BasicAuthentication, TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, repository_id):
+        repository = get_object_or_404(
+            Repository, id=repository_id, git_account__user=request.user
+        )
+        path = request.query_params.get('path', '').strip('/')
+        if not path:
+            raise ValidationError('path query param is required.')
+        ref = request.query_params.get('ref') or repository.default_branch
+        if not ref:
+            raise ValidationError('No ref provided and repository has no default_branch on record.')
+        git_account = repository.git_account
+
+        try:
+            if git_account.provider == GitAccount.Provider.GITLAB:
+                raw = gitlab.get_file(git_account.access_token, repository.provider_repo_id, path, ref)
+            else:
+                owner, name = repository.full_name.split('/', 1)
+                raw = github.get_contents(git_account.access_token, owner, name, path, ref)
+                if isinstance(raw, list):
+                    raise ValidationError('path points to a directory, not a file.')
+        except requests.HTTPError as exc:
+            raise ValidationError(f'Failed to fetch file: {exc}')
+
+        encoded_content = raw.get('content', '')
+        content_bytes = base64.b64decode(encoded_content) if encoded_content else b''
+        try:
+            content, binary = content_bytes.decode('utf-8'), False
+        except UnicodeDecodeError:
+            content, binary = base64.b64encode(content_bytes).decode('ascii'), True
+
+        return Response(
+            {
+                'path': path,
+                'ref': ref,
+                'size': raw.get('size'),
+                'binary': binary,
+                'content': content,
+            }
+        )
+
+
+class RepositoryLanguageStatsView(APIView):
+    """GitHub-style language bar for one repository — e.g. Python 50%, HTML 10%,
+    JavaScript 30%. Computed entirely from already-synced CommitFile rows (no extra
+    GitHub/GitLab API calls), so it updates automatically after every sync."""
+
+    authentication_classes = [SessionAuthentication, BasicAuthentication, TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, repository_id):
+        repository = get_object_or_404(
+            Repository, id=repository_id, git_account__user=request.user
+        )
+        commit_files = CommitFile.objects.filter(commit__repository=repository)
+        languages = calculate_language_stats(commit_files)
+
+        return Response({'repository': repository.full_name, 'languages': languages})
 
 
 class RepositoryMergeRequestListView(generics.ListAPIView):
